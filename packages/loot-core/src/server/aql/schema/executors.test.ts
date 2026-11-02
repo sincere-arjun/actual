@@ -5,6 +5,7 @@ import fc from 'fast-check';
 import * as arbs from '#mocks/arbitrary-schema';
 import * as db from '#server/db';
 import { batchMessages, setSyncingMode } from '#server/sync';
+import { conditionsToAQL } from '#server/transactions/transaction-rules';
 import { q } from '#shared/query';
 import { groupById } from '#shared/util';
 import { aqlQuery } from '..';
@@ -216,13 +217,19 @@ describe('transaction executors', () => {
               const amount = trans.amount || 0;
               return (amount < -5 || amount > -2) && trans.payee != null;
             };
-            const matchedParentIds = new Set(
-              alive.filter(t => t.is_parent && matches(t)).map(t => t.id),
+            const parentsWithMatchedChild = new Set(
+              alive
+                .filter(t => t.parent_id && matches(t))
+                .map(t => t.parent_id),
             );
 
-            // A matched parent is counted in place of its children
+            // A matched parent is counted only when none of its
+            // children match
             const sum = alive.reduce((sum, trans) => {
-              if (matches(trans) && !matchedParentIds.has(trans.parent_id)) {
+              if (
+                matches(trans) &&
+                !(trans.is_parent && parentsWithMatchedChild.has(trans.id))
+              ) {
                 return sum + (trans.amount || 0);
               }
               return sum;
@@ -244,7 +251,15 @@ describe('transaction executors', () => {
   }, 20_000);
 
   describe('aggregate queries with `splits: grouped` and split filters', () => {
-    function splitTransactions({ parentNotes = null, childNotes = [] }) {
+    function splitTransactions({
+      parentNotes = null,
+      childNotes = [],
+      childCategories = [],
+    }: {
+      parentNotes?: string | null;
+      childNotes?: Array<string | null>;
+      childCategories?: Array<string | null>;
+    }) {
       const base = { account: 'acct', date: '2024-01-01' };
       return [
         {
@@ -259,6 +274,7 @@ describe('transaction executors', () => {
           id: 'child1',
           amount: -30,
           notes: childNotes[0] ?? null,
+          category: childCategories[0] ?? null,
           is_child: true,
           parent_id: 'parent',
         },
@@ -267,6 +283,7 @@ describe('transaction executors', () => {
           id: 'child2',
           amount: -70,
           notes: childNotes[1] ?? null,
+          category: childCategories[1] ?? null,
           is_child: true,
           parent_id: 'parent',
         },
@@ -275,10 +292,21 @@ describe('transaction executors', () => {
       ];
     }
 
-    async function filteredSum() {
+    beforeEach(async () => {
+      await db.insertAccount({ id: 'acct', name: 'Checking', offbudget: 0 });
+      await db.insertCategoryGroup({ id: 'group', name: 'Group' });
+      await db.insertCategory({
+        id: 'groceries',
+        name: 'Groceries',
+        cat_group: 'group',
+      });
+      await db.insertCategory({ id: 'fuel', name: 'Fuel', cat_group: 'group' });
+    });
+
+    async function sumOf(filter) {
       const { data } = await aqlQuery(
         q('transactions')
-          .filter({ notes: { $like: '%kro%' } })
+          .filter(filter)
           .options({ splits: 'grouped' })
           .calculate({ $sum: '$amount' })
           .serialize(),
@@ -286,16 +314,30 @@ describe('transaction executors', () => {
       return data;
     }
 
+    // Filters built the same way as the account filter bar
+    function sumOfConditions(conditions) {
+      const { filters } = conditionsToAQL(conditions);
+      return sumOf({ $and: filters });
+    }
+
     it('counts a split parent whose notes match', async () => {
       await insertTransactions(splitTransactions({ parentNotes: 'kroger' }));
-      expect(await filteredSum()).toBe(-110);
+      expect(
+        await sumOfConditions([
+          { op: 'contains', field: 'notes', value: 'kro' },
+        ]),
+      ).toBe(-110);
     });
 
     it('counts only the matching children when the parent does not match', async () => {
       await insertTransactions(
         splitTransactions({ childNotes: ['kroger', null] }),
       );
-      expect(await filteredSum()).toBe(-40);
+      expect(
+        await sumOfConditions([
+          { op: 'contains', field: 'notes', value: 'kro' },
+        ]),
+      ).toBe(-40);
     });
 
     it('does not double count a matching parent and its matching children', async () => {
@@ -305,13 +347,86 @@ describe('transaction executors', () => {
           childNotes: ['kroger', 'kroger'],
         }),
       );
-      expect(await filteredSum()).toBe(-110);
+      expect(
+        await sumOfConditions([
+          { op: 'contains', field: 'notes', value: 'kro' },
+        ]),
+      ).toBe(-110);
     });
 
     it('ignores a matching parent that has been deleted', async () => {
       const [parent, ...rest] = splitTransactions({ parentNotes: 'kroger' });
       await insertTransactions([{ ...parent, tombstone: true }, ...rest]);
-      expect(await filteredSum()).toBe(-10);
+      expect(
+        await sumOfConditions([
+          { op: 'contains', field: 'notes', value: 'kro' },
+        ]),
+      ).toBe(-10);
+    });
+
+    it('counts the matching children when the parent amount also matches', async () => {
+      await insertTransactions(splitTransactions({}));
+      // Parent -100 and child -70 match; only the child is counted
+      expect(await sumOf({ amount: { $lt: -50 } })).toBe(-1070);
+    });
+
+    it('does not count excluded children for "category is not"', async () => {
+      await insertTransactions(
+        splitTransactions({ childCategories: ['groceries', 'fuel'] }),
+      );
+      expect(
+        await sumOfConditions([
+          { op: 'isNot', field: 'category', value: 'groceries' },
+        ]),
+      ).toBe(-1080);
+    });
+
+    it('does not count excluded children for "notes does not contain"', async () => {
+      await insertTransactions(
+        splitTransactions({ childNotes: ['kroger', null] }),
+      );
+      expect(
+        await sumOfConditions([
+          { op: 'doesNotContain', field: 'notes', value: 'kro' },
+        ]),
+      ).toBe(-1070);
+    });
+
+    it('counts only uncategorized children for "category is nothing"', async () => {
+      await insertTransactions(
+        splitTransactions({ childCategories: ['groceries', null] }),
+      );
+      expect(
+        await sumOfConditions([{ op: 'is', field: 'category', value: null }]),
+      ).toBe(-1080);
+    });
+
+    it('gives the same on-budget total on the happy and unhappy paths', async () => {
+      await insertTransactions(splitTransactions({}));
+
+      const andFilter = {
+        $and: [{ 'account.offbudget': false }, { 'account.closed': false }],
+      };
+      const flatFilter = {
+        'account.offbudget': false,
+        'account.closed': false,
+      };
+      expect(
+        isHappyPathQuery(q('transactions').filter(andFilter).serialize()),
+      ).toBe(false);
+      expect(
+        isHappyPathQuery(q('transactions').filter(flatFilter).serialize()),
+      ).toBe(true);
+
+      const { data: inlineSum } = await aqlQuery(
+        q('transactions')
+          .filter(flatFilter)
+          .calculate({ $sum: '$amount' })
+          .serialize(),
+      );
+      expect(inlineSum).toBe(-1110);
+      expect(await sumOf(andFilter)).toBe(inlineSum);
+      expect(await sumOf(flatFilter)).toBe(inlineSum);
     });
   });
 

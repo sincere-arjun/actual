@@ -107,11 +107,12 @@ async function execTransactionsGrouped(
   // Aggregate queries don't make sense for a grouped transactions
   // query. We never should include both parent and children
   // transactions as it would duplicate amounts and the final number
-  // would never make sense. Instead, a split parent that matches is
-  // counted in place of its children, and otherwise only the matching
-  // children are counted
+  // would never make sense. Instead, the matching children are
+  // counted, and a matching split parent is counted only when none of
+  // its children match
   if (isAggregateQuery(queryState)) {
     const s = { ...sqlPieces };
+    let aggParams = params;
 
     // We also want to exclude deleted transactions. Normally we
     // handle this manually down below, but now that we are doing a
@@ -128,26 +129,21 @@ async function execTransactionsGrouped(
       // can simply count the non-parents
       s.where = appendWhere(s.where, `${s.from}.is_parent = 0`);
     } else {
-      const matchedParents = await db.all<{ id: string }>(
-        `SELECT ${s.from}.id FROM ${from} ${s.joins}
-         ${appendWhere(s.where, `${s.from}.is_parent = 1`)}`,
-        params,
+      // The subquery repeats the filter to find the parents with a
+      // matching child, so the params are bound a second time
+      s.where = appendWhere(
+        s.where,
+        `(${s.from}.is_parent = 0 OR ${s.from}.id NOT IN (
+          SELECT ${s.from}.parent_id FROM ${from} ${s.joins}
+          ${appendWhere(s.where, `${s.from}.is_child = 1`)}
+        ))`,
       );
-
-      if (matchedParents.length > 0) {
-        s.where = appendWhere(
-          s.where,
-          `(${s.from}.parent_id IS NULL OR NOT ${whereIn(
-            matchedParents.map(row => row.id),
-            `${s.from}.parent_id`,
-          )})`,
-        );
-      }
+      aggParams = [...params, ...params];
     }
 
     s.from = from;
 
-    return execQuery(queryState, compilerState, s, params, outputTypes);
+    return execQuery(queryState, compilerState, s, aggParams, outputTypes);
   }
 
   let rows;
