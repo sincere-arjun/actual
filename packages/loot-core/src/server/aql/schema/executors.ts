@@ -96,6 +96,20 @@ export function isHappyPathQuery(queryState) {
 
 const NEGATED_OPS = ['$ne', '$notlike', '$notregexp'];
 
+// REGEXP tests a NULL value as an empty string
+function _regexpMatchesEmpty(regex) {
+  if (typeof regex !== 'string') {
+    // A pattern only known at run time, like a param, might
+    return true;
+  }
+  try {
+    return new RegExp(regex).test('');
+  } catch {
+    // An invalid pattern matches nothing in REGEXP
+    return false;
+  }
+}
+
 // Whether the filter has a condition that an empty value can match,
 // like "is not" or "is nothing"
 function _matchesEmpty(filter) {
@@ -108,6 +122,9 @@ function _matchesEmpty(filter) {
   return Object.entries(filter).some(([key, value]) => {
     if (NEGATED_OPS.includes(key)) {
       return true;
+    }
+    if (key === '$regexp') {
+      return _regexpMatchesEmpty(value);
     }
     if (key === '$eq' || !key.startsWith('$')) {
       return value == null || _matchesEmpty(value);

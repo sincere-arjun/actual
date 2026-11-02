@@ -469,6 +469,39 @@ describe('transaction executors', () => {
         ).toBe(0);
       });
 
+      it('when a "notes matches" pattern excludes every child', async () => {
+        await insertTransactions(
+          splitTransactions({ childNotes: ['kroger', 'kroger'] }),
+        );
+        expect(
+          await sumOfConditions([
+            { op: 'matches', field: 'notes', value: '^(?!.*kro)' },
+          ]),
+        ).toBe(-1000);
+      });
+
+      it('when a "category matches" pattern excludes every child', async () => {
+        await insertTransactions(
+          splitTransactions({ childCategories: ['groceries', 'groceries'] }),
+        );
+        expect(
+          await sumOfConditions([
+            { op: 'matches', field: 'category', value: '^(?!Groceries)' },
+          ]),
+        ).toBe(-1010);
+      });
+
+      it('when a "notes matches" pattern for an empty note excludes every child', async () => {
+        await insertTransactions(
+          splitTransactions({ childNotes: ['kroger', 'kroger'] }),
+        );
+        expect(
+          await sumOfConditions([
+            { op: 'matches', field: 'notes', value: '^$' },
+          ]),
+        ).toBe(0);
+      });
+
       it('when combined with a positive filter that only the parent matches', async () => {
         await insertTransactions(
           splitTransactions({
