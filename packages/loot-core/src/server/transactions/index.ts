@@ -163,7 +163,9 @@ export async function batchUpdateTransactions({
       await Promise.all(allAdded.map(t => transfer.onInsert(t)));
 
       // Return any updates from here
-      const claimedTransfers = new Set<string>();
+      // onInsert above may be pairing the added transactions, but its writes
+      // only land when the batch ends, so never link updates to them
+      const claimedTransfers = new Set(allAdded.map(t => t.id));
       transfersUpdated = (
         await Promise.all(
           allUpdated.map(t => transfer.onUpdate(t, claimedTransfers)),

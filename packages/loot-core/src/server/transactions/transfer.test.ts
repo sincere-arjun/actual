@@ -408,6 +408,39 @@ describe('Transfer', () => {
       expect(two.reduce((sum, t) => sum + t.amount, 0)).toBe(-5000);
     });
 
+    test('a transaction added in the same batch is never linked', async () => {
+      await prepareDatabase();
+      const { transferOne, transferTwo } = await getTransferPayees();
+
+      const inOne = await db.insertTransaction({
+        account: 'one',
+        amount: 2500,
+        payee: await db.insertPayee({ name: 'b' }),
+        date: '2017-01-01',
+      });
+
+      await batchUpdateTransactions({
+        added: [
+          {
+            id: 'added',
+            account: 'two',
+            amount: -2500,
+            payee: transferOne.id,
+            date: '2017-01-01',
+          },
+        ],
+        updated: [{ id: inOne, payee: transferTwo.id }],
+      });
+
+      const all = await getAllTransactions();
+      const byId = new Map(all.map(t => [t.id, t]));
+      for (const t of all) {
+        expect(t.transfer_id).not.toBeNull();
+        expect(byId.get(t.transfer_id).transfer_id).toBe(t.id);
+      }
+      expect(all).toHaveLength(4);
+    });
+
     test('a starting balance is never linked', async () => {
       await prepareDatabase();
       const { transferOne } = await getTransferPayees();
@@ -462,6 +495,39 @@ describe('Transfer', () => {
       const linked = await db.getTransaction(inOne);
       expect(linked.transfer_id).toBe(inTwo);
       expect(linked.schedule).toBe('schedule1');
+    });
+
+    // Pins today's behaviour behind the known limitation below, so the
+    // test.fails case can't pass just because linking broke
+    test('payee removed -> linked counterpart is deleted (current behaviour)', async () => {
+      await prepareDatabase();
+      const { transferOne } = await getTransferPayees();
+
+      const inOne = await db.insertTransaction({
+        account: 'one',
+        amount: 2500,
+        payee: await db.insertPayee({ name: 'b' }),
+        date: '2017-01-01',
+      });
+      const inTwo = await db.insertTransaction({
+        account: 'two',
+        amount: -2500,
+        payee: await db.insertPayee({ name: 'a' }),
+        date: '2017-01-01',
+      });
+
+      await applyActions(
+        [await db.getTransaction(inTwo)],
+        [{ op: 'set', field: 'payee', value: transferOne.id }],
+      );
+      expect((await db.getTransaction(inOne)).transfer_id).toBe(inTwo);
+
+      await batchUpdateTransactions({
+        updated: [{ id: inTwo, payee: await db.insertPayee({ name: 'c' }) }],
+      });
+
+      expect((await db.getTransaction(inTwo)).transfer_id).toBeNull();
+      expect(await db.getTransaction(inOne)).toBeUndefined();
     });
 
     // Known limitation: nothing records whether the other side of a transfer
