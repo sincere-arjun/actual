@@ -127,7 +127,12 @@ function serveTransactions(rows: Row[]) {
       calls.makeFilters++;
       const { conditions } = args as { conditions: RuleConditionEntity[] };
       return {
-        filters: conditions.map(cond => {
+        // Like the real filter builder, conditions that fail to parse (here an
+        // empty "contains") are dropped from the result.
+        filters: conditions.flatMap(cond => {
+          if (cond.op === 'contains' && cond.value === '') {
+            return [];
+          }
           if (cond.op === 'hasTags' || cond.op === 'hasAnyTag') {
             const tagFilters = String(cond.value)
               .split(/\s+/)
@@ -273,6 +278,20 @@ describe('fetchSpreadsheetQueryData tag filters on split transactions', () => {
     expect(
       await fetchDebtsTotal([{ field: 'category', op: 'is', value: 'travel' }]),
     ).toBe(-75000);
+    expect(calls).toEqual({ makeFilters: 1, queries: 2 });
+  });
+
+  it('leaves filters unchanged when a condition was dropped', async () => {
+    const calls = serveTransactions(issueTransactions([null, null]));
+
+    // Two conditions but only one filter, so they can't be paired: the report
+    // keeps its old behaviour and no parent lookup runs.
+    expect(
+      await fetchDebtsTotal([
+        hasTestTag,
+        { field: 'notes', op: 'contains', value: '' },
+      ]),
+    ).toBe(-5000);
     expect(calls).toEqual({ makeFilters: 1, queries: 2 });
   });
 });
