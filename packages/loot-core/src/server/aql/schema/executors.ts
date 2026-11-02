@@ -97,8 +97,9 @@ export function isHappyPathQuery(queryState) {
 const NEGATED_OPS = ['$ne', '$notlike', '$notregexp'];
 
 // REGEXP tests a NULL value as an empty string. Only literal patterns
-// are checked: a named param (':name') is tested as the pattern
-// itself, which is fine while no caller passes named params
+// are checked, after unescaping `\$` the way `compileLiteral` does: a
+// named param (':name') is tested as the pattern itself, which is fine
+// while no caller passes named params
 function _regexpMatchesEmpty(regex) {
   if (typeof regex !== 'string') {
     // A pattern that is not a string can't be checked, so assume it
@@ -106,7 +107,7 @@ function _regexpMatchesEmpty(regex) {
     return true;
   }
   try {
-    return new RegExp(regex).test('');
+    return new RegExp(regex.replace(/\\\$/g, '$')).test('');
   } catch {
     // An invalid pattern matches nothing in REGEXP
     return false;

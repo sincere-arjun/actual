@@ -502,6 +502,18 @@ describe('transaction executors', () => {
         ).toBe(0);
       });
 
+      it('when a "notes matches" pattern with an escaped `$` excludes every child', async () => {
+        await insertTransactions(
+          splitTransactions({ childNotes: ['kroger', 'kroger'] }),
+        );
+        // The compiler turns `\$` into `$`, so this pattern is `^$`
+        expect(
+          await sumOfConditions([
+            { op: 'matches', field: 'notes', value: '^\\$' },
+          ]),
+        ).toBe(0);
+      });
+
       it('when combined with a positive filter that only the parent matches', async () => {
         await insertTransactions(
           splitTransactions({
