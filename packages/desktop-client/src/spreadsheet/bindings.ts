@@ -52,9 +52,7 @@ export function accountBalanceUncleared(accountId: AccountEntity['id']) {
 
 export function allAccountBalance() {
   return {
-    query: q('transactions')
-      .filter({ 'account.closed': false })
-      .calculate({ $sum: '$amount' }),
+    query: q('transactions').calculate({ $sum: '$amount' }),
     name: 'accounts-balance',
   } satisfies Binding<'account', 'accounts-balance'>;
 }
