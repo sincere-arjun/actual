@@ -1,4 +1,3 @@
-import { send } from '@actual-app/core/platform/client/connection';
 import { q } from '@actual-app/core/shared/query';
 import type { ObjectExpression } from '@actual-app/core/shared/query';
 import type {
@@ -27,23 +26,24 @@ async function includeTaggedSplitParents(
   conditions: RuleConditionEntity[],
   filters: unknown[],
 ) {
+  // `filters` was built from these conditions, one filter per condition.
+  // If a condition failed to parse the two no longer line up, so leave the
+  // filters as they are.
   const reportConditions = conditions.filter(cond => !cond.customName);
-  if (!reportConditions.some(isTagCondition)) {
+  if (
+    !reportConditions.some(isTagCondition) ||
+    reportConditions.length !== filters.length
+  ) {
     return filters;
   }
 
-  const [{ filters: otherFilters }, { filters: tagFilters }] =
-    await Promise.all([
-      send('make-filters-from-conditions', {
-        conditions: reportConditions.filter(cond => !isTagCondition(cond)),
-      }),
-      send('make-filters-from-conditions', {
-        conditions: reportConditions.filter(isTagCondition),
-      }),
-    ]);
+  return Promise.all(
+    filters.map(async (filter, index) => {
+      if (!isTagCondition(reportConditions[index])) {
+        return filter;
+      }
 
-  const parentTagFilters = await Promise.all(
-    (tagFilters as ObjectExpression[]).map(async tagFilter => {
+      const tagFilter = filter as ObjectExpression;
       const { data: parents } = await aqlQuery(
         q('transactions')
           .options({ splits: 'all' })
@@ -64,8 +64,6 @@ async function includeTaggedSplitParents(
       };
     }),
   );
-
-  return [...otherFilters, ...parentTagFilters];
 }
 
 export async function fetchSpreadsheetQueryData({

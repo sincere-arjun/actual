@@ -121,17 +121,20 @@ function matches(row: Row, filter: Record<string, unknown>): boolean {
 // table, following the transactions executor's split handling: parents are
 // excluded unless the query asks for `splits: 'all'`.
 function serveTransactions(rows: Row[]) {
+  const calls = { makeFilters: 0, queries: 0 };
   initServer({
     'make-filters-from-conditions': async args => {
+      calls.makeFilters++;
       const { conditions } = args as { conditions: RuleConditionEntity[] };
       return {
         filters: conditions.map(cond => {
-          if (cond.op === 'hasTags') {
-            return {
-              $and: [
-                { notes: { $regexp: makeTagAqlRegex(String(cond.value)) } },
-              ],
-            };
+          if (cond.op === 'hasTags' || cond.op === 'hasAnyTag') {
+            const tagFilters = String(cond.value)
+              .split(/\s+/)
+              .map(tag => ({ notes: { $regexp: makeTagAqlRegex(tag) } }));
+            return cond.op === 'hasTags'
+              ? { $and: tagFilters }
+              : { $or: tagFilters };
           }
           if (cond.op === 'is' && cond.field === 'category') {
             return { category: cond.value };
@@ -141,6 +144,7 @@ function serveTransactions(rows: Row[]) {
       };
     },
     query: async args => {
+      calls.queries++;
       const query = args as QueryState;
       const splits = query.tableOptions?.splits ?? 'inline';
       const data = rows
@@ -153,9 +157,13 @@ function serveTransactions(rows: Row[]) {
       return { data, dependencies: [] };
     },
   });
+  return calls;
 }
 
-async function fetchDebtsTotal(conditions: RuleConditionEntity[]) {
+async function fetchDebtsTotal(
+  conditions: RuleConditionEntity[],
+  conditionsOp: 'and' | 'or' = 'and',
+) {
   const { send } = await import('@actual-app/core/platform/client/connection');
   const { filters } = (await send('make-filters-from-conditions', {
     conditions,
@@ -169,8 +177,8 @@ async function fetchDebtsTotal(conditions: RuleConditionEntity[]) {
     categories: [],
     categoryGroups: [],
     conditions,
-    conditionsOp: 'and',
-    conditionsOpKey: '$and',
+    conditionsOp,
+    conditionsOpKey: conditionsOp === 'or' ? '$or' : '$and',
     filters,
     groupBy: 'Category',
   });
@@ -218,5 +226,53 @@ describe('fetchSpreadsheetQueryData tag filters on split transactions', () => {
         { field: 'category', op: 'is', value: 'travel' },
       ]),
     ).toBe(-75000);
+  });
+
+  it('includes the children of a tagged parent for "has any tag"', async () => {
+    serveTransactions(issueTransactions([null, null]));
+
+    expect(
+      await fetchDebtsTotal([
+        { field: 'notes', op: 'hasAnyTag', value: '#other #test-tag' },
+      ]),
+    ).toBe(-105000);
+  });
+
+  it('includes the children of a tagged parent when conditions are or-ed', async () => {
+    serveTransactions([
+      ...issueTransactions([null, null]),
+      transaction({
+        id: 'other',
+        notes: 'Untagged',
+        category: 'fees',
+        amount: -40000,
+      }),
+    ]);
+
+    expect(
+      await fetchDebtsTotal(
+        [hasTestTag, { field: 'category', op: 'is', value: 'fees' }],
+        'or',
+      ),
+    ).toBe(-145000);
+  });
+
+  it('reuses the report filters instead of rebuilding them', async () => {
+    const calls = serveTransactions(issueTransactions([null, null]));
+
+    await fetchDebtsTotal([hasTestTag]);
+
+    // One filter build by the caller; one parent lookup plus the assets and
+    // debts queries.
+    expect(calls).toEqual({ makeFilters: 1, queries: 3 });
+  });
+
+  it('leaves reports without a tag condition unchanged', async () => {
+    const calls = serveTransactions(issueTransactions([null, null]));
+
+    expect(
+      await fetchDebtsTotal([{ field: 'category', op: 'is', value: 'travel' }]),
+    ).toBe(-75000);
+    expect(calls).toEqual({ makeFilters: 1, queries: 2 });
   });
 });
