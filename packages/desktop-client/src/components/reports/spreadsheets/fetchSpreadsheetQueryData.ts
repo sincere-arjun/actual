@@ -1,3 +1,6 @@
+import { send } from '@actual-app/core/platform/client/connection';
+import { q } from '@actual-app/core/shared/query';
+import type { ObjectExpression } from '@actual-app/core/shared/query';
 import type {
   balanceTypeOpType,
   CategoryEntity,
@@ -11,6 +14,59 @@ import { aqlQuery } from '#queries/aqlQuery';
 
 import { fetchBudgetData } from './budgetDataQuery';
 import { makeQuery } from './makeQuery';
+
+function isTagCondition(cond: RuleConditionEntity) {
+  return cond.op === 'hasTags' || cond.op === 'hasAnyTag';
+}
+
+// Reports only count split children, so a tag written on a split parent's
+// notes would never match. Let each tag filter also match the children of
+// parents that carry the tag. Parents stay excluded, so nothing is counted
+// twice.
+async function includeTaggedSplitParents(
+  conditions: RuleConditionEntity[],
+  filters: unknown[],
+) {
+  const reportConditions = conditions.filter(cond => !cond.customName);
+  if (!reportConditions.some(isTagCondition)) {
+    return filters;
+  }
+
+  const [{ filters: otherFilters }, { filters: tagFilters }] =
+    await Promise.all([
+      send('make-filters-from-conditions', {
+        conditions: reportConditions.filter(cond => !isTagCondition(cond)),
+      }),
+      send('make-filters-from-conditions', {
+        conditions: reportConditions.filter(isTagCondition),
+      }),
+    ]);
+
+  const parentTagFilters = await Promise.all(
+    (tagFilters as ObjectExpression[]).map(async tagFilter => {
+      const { data: parents } = await aqlQuery(
+        q('transactions')
+          .options({ splits: 'all' })
+          .filter({ is_parent: true })
+          .filter(tagFilter)
+          .select('id'),
+      );
+      if (parents.length === 0) {
+        return tagFilter;
+      }
+      return {
+        $or: [
+          tagFilter,
+          {
+            parent_id: { $oneof: parents.map(({ id }: { id: string }) => id) },
+          },
+        ],
+      };
+    }),
+  );
+
+  return [...otherFilters, ...parentTagFilters];
+}
 
 export async function fetchSpreadsheetQueryData({
   balanceTypeOp,
@@ -51,6 +107,8 @@ export async function fetchSpreadsheetQueryData({
       budgetType,
     });
   }
+
+  filters = await includeTaggedSplitParents(conditions, filters);
 
   const [assets, debts] = await Promise.all([
     aqlQuery(
