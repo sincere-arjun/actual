@@ -163,8 +163,11 @@ export async function batchUpdateTransactions({
       await Promise.all(allAdded.map(t => transfer.onInsert(t)));
 
       // Return any updates from here
+      const claimedTransfers = new Set<string>();
       transfersUpdated = (
-        await Promise.all(allUpdated.map(t => transfer.onUpdate(t)))
+        await Promise.all(
+          allUpdated.map(t => transfer.onUpdate(t, claimedTransfers)),
+        )
       ).filter(Boolean);
 
       await Promise.all(allDeleted.map(t => transfer.onDelete(t)));
