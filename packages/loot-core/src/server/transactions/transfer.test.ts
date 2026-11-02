@@ -2,7 +2,10 @@
 import { expectSnapshotWithDiffer } from '#mocks/util';
 import * as db from '#server/db';
 
+import { applyActions } from './transaction-rules';
 import * as transfer from './transfer';
+
+import { batchUpdateTransactions } from '.';
 
 beforeEach(global.emptyDatabase());
 
@@ -217,5 +220,153 @@ describe('Transfer', () => {
     child = await db.getTransaction(child.id);
     expect(child.transfer_id).not.toBe(parent.transfer_id);
     expect(child.payee).toBe(transferOne.id);
+  });
+
+  describe('linking existing transactions', () => {
+    async function getTransferPayees() {
+      const [transferOne, transferTwo] = await Promise.all([
+        db.first<db.DbPayee>(
+          "SELECT * FROM payees WHERE transfer_acct = 'one'",
+        ),
+        db.first<db.DbPayee>(
+          "SELECT * FROM payees WHERE transfer_acct = 'two'",
+        ),
+      ]);
+      return { transferOne, transferTwo };
+    }
+
+    async function getAccountTransactions(account: string) {
+      return (await getAllTransactions()).filter(t => t.account === account);
+    }
+
+    test('applying a transfer payee links the matching transaction in the other account', async () => {
+      await prepareDatabase();
+      const { transferOne, transferTwo } = await getTransferPayees();
+
+      const inOne = await db.insertTransaction({
+        account: 'one',
+        amount: 2500,
+        payee: await db.insertPayee({ name: 'b' }),
+        date: '2017-01-01',
+      });
+      const inTwo = await db.insertTransaction({
+        account: 'two',
+        amount: -2500,
+        payee: await db.insertPayee({ name: 'a' }),
+        date: '2017-01-01',
+      });
+
+      await applyActions(
+        [await db.getTransaction(inTwo)],
+        [{ op: 'set', field: 'payee', value: transferOne.id }],
+      );
+
+      const one = await getAccountTransactions('one');
+      const two = await getAccountTransactions('two');
+      expect(one).toHaveLength(1);
+      expect(two).toHaveLength(1);
+      expect(one[0]).toMatchObject({
+        id: inOne,
+        amount: 2500,
+        payee: transferTwo.id,
+        transfer_id: inTwo,
+      });
+      expect(two[0]).toMatchObject({
+        id: inTwo,
+        amount: -2500,
+        payee: transferOne.id,
+        transfer_id: inOne,
+      });
+    });
+
+    test('updating both sides in one batch links them to each other', async () => {
+      await prepareDatabase();
+      const { transferOne, transferTwo } = await getTransferPayees();
+
+      const inOne = await db.insertTransaction({
+        account: 'one',
+        amount: 2500,
+        payee: await db.insertPayee({ name: 'b' }),
+        date: '2017-01-01',
+      });
+      const inTwo = await db.insertTransaction({
+        account: 'two',
+        amount: -2500,
+        payee: await db.insertPayee({ name: 'a' }),
+        date: '2017-01-01',
+      });
+
+      await batchUpdateTransactions({
+        updated: [
+          { id: inOne, payee: transferTwo.id },
+          { id: inTwo, payee: transferOne.id },
+        ],
+      });
+
+      const one = await getAccountTransactions('one');
+      const two = await getAccountTransactions('two');
+      expect(one).toHaveLength(1);
+      expect(two).toHaveLength(1);
+      expect(one[0]).toMatchObject({ id: inOne, transfer_id: inTwo });
+      expect(two[0]).toMatchObject({ id: inTwo, transfer_id: inOne });
+    });
+
+    test('a new transfer is created when the match is ambiguous', async () => {
+      await prepareDatabase();
+      const { transferOne } = await getTransferPayees();
+
+      for (let i = 0; i < 2; i++) {
+        await db.insertTransaction({
+          account: 'one',
+          amount: 2500,
+          payee: await db.insertPayee({ name: `b${i}` }),
+          date: '2017-01-01',
+        });
+      }
+      const inTwo = await db.insertTransaction({
+        account: 'two',
+        amount: -2500,
+        payee: await db.insertPayee({ name: 'a' }),
+        date: '2017-01-01',
+      });
+
+      await applyActions(
+        [await db.getTransaction(inTwo)],
+        [{ op: 'set', field: 'payee', value: transferOne.id }],
+      );
+
+      const one = await getAccountTransactions('one');
+      expect(one).toHaveLength(3);
+      expect(one.filter(t => t.transfer_id === inTwo)).toHaveLength(1);
+      expect(one.filter(t => t.transfer_id == null)).toHaveLength(2);
+    });
+
+    test('a reconciled transaction is never linked', async () => {
+      await prepareDatabase();
+      const { transferOne } = await getTransferPayees();
+
+      const inOne = await db.insertTransaction({
+        account: 'one',
+        amount: 2500,
+        payee: await db.insertPayee({ name: 'b' }),
+        date: '2017-01-01',
+        reconciled: true,
+      });
+      const inTwo = await db.insertTransaction({
+        account: 'two',
+        amount: -2500,
+        payee: await db.insertPayee({ name: 'a' }),
+        date: '2017-01-01',
+      });
+
+      await applyActions(
+        [await db.getTransaction(inTwo)],
+        [{ op: 'set', field: 'payee', value: transferOne.id }],
+      );
+
+      const one = await getAccountTransactions('one');
+      expect(one).toHaveLength(2);
+      expect(one.find(t => t.id === inOne).transfer_id).toBeNull();
+    });
   });
 });

@@ -92,6 +92,52 @@ export async function addTransfer(transaction, transferredAccount) {
   };
 }
 
+// When an existing transaction becomes a transfer, the other side may already
+// exist in the destination account (e.g. both sides were entered or imported
+// before a rule turned them into a transfer). Link to it instead of creating a
+// duplicate, but only when there is exactly one unambiguous candidate.
+async function linkExistingTransfer(transaction, transferredAccount) {
+  if (transaction.is_child) {
+    return null;
+  }
+
+  const candidates = await db.all<Pick<db.DbViewTransaction, 'id'>>(
+    `SELECT id FROM v_transactions
+       WHERE account = ? AND date = ? AND amount = ? AND id != ?
+         AND (transfer_id IS NULL OR transfer_id = ?)
+         AND is_parent = 0 AND is_child = 0 AND reconciled = 0`,
+    [
+      transferredAccount,
+      db.toDateRepr(transaction.date),
+      -transaction.amount,
+      transaction.id,
+      transaction.id,
+    ],
+  );
+  if (candidates.length !== 1) {
+    return null;
+  }
+  const [{ id }] = candidates;
+
+  const { id: fromPayee } = await getPayee(transaction.account);
+  await db.updateTransaction({
+    id,
+    transfer_id: transaction.id,
+    payee: fromPayee,
+  });
+  await db.updateTransaction({ id: transaction.id, transfer_id: id });
+  const categoryCleared = await clearCategory(
+    { ...transaction, transfer_id: id },
+    transferredAccount,
+  );
+
+  return {
+    id: transaction.id,
+    transfer_id: id,
+    ...(categoryCleared ? { category: null } : {}),
+  };
+}
+
 export async function removeTransfer(transaction) {
   const transferTrans = await db.getTransaction(transaction.transfer_id);
 
@@ -159,7 +205,10 @@ export async function onUpdate(transaction) {
   }
 
   if (transferredAccount && !transaction.transfer_id) {
-    return addTransfer(transaction, transferredAccount);
+    return (
+      (await linkExistingTransfer(transaction, transferredAccount)) ??
+      addTransfer(transaction, transferredAccount)
+    );
   }
 
   if (!transferredAccount && transaction.transfer_id) {
