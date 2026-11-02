@@ -94,6 +94,28 @@ export function isHappyPathQuery(queryState) {
   return queryState.filterExpressions.find(_isUnhappy) == null;
 }
 
+const NEGATED_OPS = ['$ne', '$notlike', '$notregexp'];
+
+// Whether the filter has a condition that an empty value can match,
+// like "is not" or "is nothing"
+function _matchesEmpty(filter) {
+  if (Array.isArray(filter)) {
+    return filter.some(_matchesEmpty);
+  }
+  if (filter == null || typeof filter !== 'object' || filter instanceof Date) {
+    return false;
+  }
+  return Object.entries(filter).some(([key, value]) => {
+    if (NEGATED_OPS.includes(key)) {
+      return true;
+    }
+    if (key === '$eq' || !key.startsWith('$')) {
+      return value == null || _matchesEmpty(value);
+    }
+    return _matchesEmpty(value);
+  });
+}
+
 async function execTransactionsGrouped(
   compilerState: CompilerState,
   queryState: QueryState,
@@ -109,7 +131,9 @@ async function execTransactionsGrouped(
   // transactions as it would duplicate amounts and the final number
   // would never make sense. Instead, the matching children are
   // counted, and a matching split parent is counted only when none of
-  // its children match
+  // its children match. Split parents have no category and often no
+  // notes, so they match any filter for an empty value, like "is not";
+  // for those filters only the matching children are counted
   if (isAggregateQuery(queryState)) {
     const s = { ...sqlPieces };
     let aggParams = params;
@@ -124,13 +148,18 @@ async function execTransactionsGrouped(
       ? s.from
       : 'v_transactions_internal_alive v_transactions_internal';
 
-    if (isHappyPathQuery(queryState)) {
-      // Every parent matches along with all of its children, so we
-      // can simply count the non-parents
+    if (
+      isHappyPathQuery(queryState) ||
+      queryState.filterExpressions.some(_matchesEmpty)
+    ) {
+      // Either every parent matches along with all of its children, or
+      // a parent may only match through an empty value, so we can
+      // simply count the non-parents
       s.where = appendWhere(s.where, `${s.from}.is_parent = 0`);
     } else {
       // The subquery repeats the filter to find the parents with a
-      // matching child, so the params are bound a second time
+      // matching child, so the params are bound a second time. This is
+      // only safe while every param sits in the where clause
       s.where = appendWhere(
         s.where,
         `(${s.from}.is_parent = 0 OR ${s.from}.id NOT IN (

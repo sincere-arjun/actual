@@ -401,6 +401,90 @@ describe('transaction executors', () => {
       ).toBe(-1080);
     });
 
+    it('counts a matching parent when none of its children match', async () => {
+      await insertTransactions(splitTransactions({}));
+      // Only the parent -100 matches, along with the -1000
+      expect(await sumOf({ amount: { $lt: -80 } })).toBe(-1100);
+    });
+
+    it('counts the matching parent and children for an `$or` filter', async () => {
+      await insertTransactions(
+        splitTransactions({
+          parentNotes: 'kroger',
+          childCategories: ['groceries', 'fuel'],
+        }),
+      );
+      const { filters } = conditionsToAQL([
+        { op: 'contains', field: 'notes', value: 'kro' },
+        { op: 'is', field: 'category', value: 'fuel' },
+      ]);
+      // The fuel child matches, so the parent is not counted
+      expect(await sumOf({ $or: filters })).toBe(-80);
+    });
+
+    describe('negated filters only count the matching children', () => {
+      it('when "category is not" excludes every child', async () => {
+        await insertTransactions(
+          splitTransactions({ childCategories: ['groceries', 'groceries'] }),
+        );
+        expect(
+          await sumOfConditions([
+            { op: 'isNot', field: 'category', value: 'groceries' },
+          ]),
+        ).toBe(-1010);
+      });
+
+      it('when "category is not one of" excludes every child', async () => {
+        await insertTransactions(
+          splitTransactions({ childCategories: ['groceries', 'fuel'] }),
+        );
+        expect(
+          await sumOfConditions([
+            {
+              op: 'notOneOf',
+              field: 'category',
+              value: ['groceries', 'fuel'],
+            },
+          ]),
+        ).toBe(-1010);
+      });
+
+      it('when "notes does not contain" excludes every child', async () => {
+        await insertTransactions(
+          splitTransactions({ childNotes: ['kroger', 'kroger'] }),
+        );
+        expect(
+          await sumOfConditions([
+            { op: 'doesNotContain', field: 'notes', value: 'kro' },
+          ]),
+        ).toBe(-1000);
+      });
+
+      it('when "notes is nothing" excludes every child', async () => {
+        await insertTransactions(
+          splitTransactions({ childNotes: ['kroger', 'kroger'] }),
+        );
+        expect(
+          await sumOfConditions([{ op: 'is', field: 'notes', value: '' }]),
+        ).toBe(0);
+      });
+
+      it('when combined with a positive filter that only the parent matches', async () => {
+        await insertTransactions(
+          splitTransactions({
+            parentNotes: 'kroger',
+            childCategories: ['groceries', 'fuel'],
+          }),
+        );
+        expect(
+          await sumOfConditions([
+            { op: 'contains', field: 'notes', value: 'kro' },
+            { op: 'isNot', field: 'category', value: 'groceries' },
+          ]),
+        ).toBe(-10);
+      });
+    });
+
     it('gives the same on-budget total on the happy and unhappy paths', async () => {
       await insertTransactions(splitTransactions({}));
 
