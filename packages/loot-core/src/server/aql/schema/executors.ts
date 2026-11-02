@@ -107,13 +107,11 @@ async function execTransactionsGrouped(
   // Aggregate queries don't make sense for a grouped transactions
   // query. We never should include both parent and children
   // transactions as it would duplicate amounts and the final number
-  // would never make sense. In this case, switch back to the "inline"
-  // type where only non-parent transactions are considered
+  // would never make sense. Instead, a split parent that matches is
+  // counted in place of its children, and otherwise only the matching
+  // children are counted
   if (isAggregateQuery(queryState)) {
     const s = { ...sqlPieces };
-
-    // Modify the where to only include non-parents
-    s.where = appendWhere(s.where, `${s.from}.is_parent = 0`);
 
     // We also want to exclude deleted transactions. Normally we
     // handle this manually down below, but now that we are doing a
@@ -121,9 +119,33 @@ async function execTransactionsGrouped(
     // has already been generated so we can't easily change the view
     // name here; instead, we change it and map it back to the name
     // used elsewhere in the query. Ideally we'd improve this
-    if (!withDead) {
-      s.from = 'v_transactions_internal_alive v_transactions_internal';
+    const from = withDead
+      ? s.from
+      : 'v_transactions_internal_alive v_transactions_internal';
+
+    if (isHappyPathQuery(queryState)) {
+      // Every parent matches along with all of its children, so we
+      // can simply count the non-parents
+      s.where = appendWhere(s.where, `${s.from}.is_parent = 0`);
+    } else {
+      const matchedParents = await db.all<{ id: string }>(
+        `SELECT ${s.from}.id FROM ${from} ${s.joins}
+         ${appendWhere(s.where, `${s.from}.is_parent = 1`)}`,
+        params,
+      );
+
+      if (matchedParents.length > 0) {
+        s.where = appendWhere(
+          s.where,
+          `(${s.from}.parent_id IS NULL OR NOT ${whereIn(
+            matchedParents.map(row => row.id),
+            `${s.from}.parent_id`,
+          )})`,
+        );
+      }
     }
+
+    s.from = from;
 
     return execQuery(queryState, compilerState, s, params, outputTypes);
   }

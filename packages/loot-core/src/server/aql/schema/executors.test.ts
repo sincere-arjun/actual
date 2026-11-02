@@ -211,12 +211,19 @@ describe('transaction executors', () => {
 
             const { data } = await aqlQuery(aggQuery.serialize());
 
-            const sum = aliveTransactions(arr).reduce((sum, trans) => {
+            const alive = aliveTransactions(arr);
+            const matches = trans => {
               const amount = trans.amount || 0;
-              const matched =
-                (amount < -5 || amount > -2) && trans.payee != null;
-              if (!trans.tombstone && !trans.is_parent && matched) {
-                return sum + amount;
+              return (amount < -5 || amount > -2) && trans.payee != null;
+            };
+            const matchedParentIds = new Set(
+              alive.filter(t => t.is_parent && matches(t)).map(t => t.id),
+            );
+
+            // A matched parent is counted in place of its children
+            const sum = alive.reduce((sum, trans) => {
+              if (matches(trans) && !matchedParentIds.has(trans.parent_id)) {
+                return sum + (trans.amount || 0);
               }
               return sum;
             }, 0);
@@ -235,6 +242,78 @@ describe('transaction executors', () => {
         }),
     );
   }, 20_000);
+
+  describe('aggregate queries with `splits: grouped` and split filters', () => {
+    function splitTransactions({ parentNotes = null, childNotes = [] }) {
+      const base = { account: 'acct', date: '2024-01-01' };
+      return [
+        {
+          ...base,
+          id: 'parent',
+          amount: -100,
+          notes: parentNotes,
+          is_parent: true,
+        },
+        {
+          ...base,
+          id: 'child1',
+          amount: -30,
+          notes: childNotes[0] ?? null,
+          is_child: true,
+          parent_id: 'parent',
+        },
+        {
+          ...base,
+          id: 'child2',
+          amount: -70,
+          notes: childNotes[1] ?? null,
+          is_child: true,
+          parent_id: 'parent',
+        },
+        { ...base, id: 'simple', amount: -10, notes: 'kroger' },
+        { ...base, id: 'other', amount: -1000, notes: 'family' },
+      ];
+    }
+
+    async function filteredSum() {
+      const { data } = await aqlQuery(
+        q('transactions')
+          .filter({ notes: { $like: '%kro%' } })
+          .options({ splits: 'grouped' })
+          .calculate({ $sum: '$amount' })
+          .serialize(),
+      );
+      return data;
+    }
+
+    it('counts a split parent whose notes match', async () => {
+      await insertTransactions(splitTransactions({ parentNotes: 'kroger' }));
+      expect(await filteredSum()).toBe(-110);
+    });
+
+    it('counts only the matching children when the parent does not match', async () => {
+      await insertTransactions(
+        splitTransactions({ childNotes: ['kroger', null] }),
+      );
+      expect(await filteredSum()).toBe(-40);
+    });
+
+    it('does not double count a matching parent and its matching children', async () => {
+      await insertTransactions(
+        splitTransactions({
+          parentNotes: 'kroger',
+          childNotes: ['kroger', 'kroger'],
+        }),
+      );
+      expect(await filteredSum()).toBe(-110);
+    });
+
+    it('ignores a matching parent that has been deleted', async () => {
+      const [parent, ...rest] = splitTransactions({ parentNotes: 'kroger' });
+      await insertTransactions([{ ...parent, tombstone: true }, ...rest]);
+      expect(await filteredSum()).toBe(-10);
+    });
+  });
 
   function runTest(makeQuery) {
     const payeeIds = ['payee1', 'payee2', 'payee3', 'payee4', 'payee5'];
