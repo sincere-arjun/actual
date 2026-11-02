@@ -102,18 +102,25 @@ async function findExistingTransfer(transaction, transferredAccount) {
     return null;
   }
 
+  // Payee edits from the same batch are already written by now, so a
+  // candidate that is becoming a transfer to some other account is skipped
   const candidates = await db.all<Pick<db.DbViewTransaction, 'id'>>(
     `SELECT id FROM v_transactions
        WHERE account = ? AND date = ? AND amount = ? AND id != ?
          AND (transfer_id IS NULL OR transfer_id = ?)
          AND is_parent = 0 AND is_child = 0 AND reconciled = 0
-         AND starting_balance_flag = 0`,
+         AND starting_balance_flag = 0
+         AND (payee IS NULL OR payee NOT IN (
+           SELECT id FROM v_payees
+             WHERE transfer_acct IS NOT NULL AND transfer_acct != ?
+         ))`,
     [
       transferredAccount,
       db.toDateRepr(transaction.date),
       -transaction.amount,
       transaction.id,
       transaction.id,
+      transaction.account,
     ],
   );
   return candidates.length === 1 ? candidates[0].id : null;

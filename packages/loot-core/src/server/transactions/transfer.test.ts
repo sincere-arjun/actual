@@ -441,6 +441,108 @@ describe('Transfer', () => {
       expect(all).toHaveLength(4);
     });
 
+    test.each(['source', 'candidate'])(
+      'a transfer to another account set in the same batch is kept (%s updated first)',
+      async first => {
+        await prepareDatabase();
+        const { transferTwo } = await getTransferPayees();
+        const transferThree = await db.first<db.DbPayee>(
+          "SELECT * FROM payees WHERE transfer_acct = 'three'",
+        );
+
+        const inOne = await db.insertTransaction({
+          account: 'one',
+          amount: 2500,
+          payee: await db.insertPayee({ name: 'b' }),
+          date: '2017-01-01',
+        });
+        const inTwo = await db.insertTransaction({
+          account: 'two',
+          amount: -2500,
+          payee: await db.insertPayee({ name: 'a' }),
+          date: '2017-01-01',
+        });
+
+        const updates = [
+          { id: inOne, payee: transferTwo.id },
+          { id: inTwo, payee: transferThree.id },
+        ];
+        await batchUpdateTransactions({
+          updated: first === 'source' ? updates : updates.reverse(),
+        });
+
+        const all = await getAllTransactions();
+        const byId = new Map(all.map(t => [t.id, t]));
+        expect(all).toHaveLength(4);
+        for (const t of all) {
+          expect(t.transfer_id).not.toBeNull();
+          expect(byId.get(t.transfer_id).transfer_id).toBe(t.id);
+        }
+        expect(byId.get(inOne)).toMatchObject({ payee: transferTwo.id });
+        expect(byId.get(byId.get(inOne).transfer_id).account).toBe('two');
+        expect(byId.get(inTwo)).toMatchObject({ payee: transferThree.id });
+        expect(byId.get(byId.get(inTwo).transfer_id).account).toBe('three');
+      },
+    );
+
+    test('the linked transaction loses its category between on-budget accounts', async () => {
+      await prepareDatabase();
+      const { transferOne } = await getTransferPayees();
+
+      const inOne = await db.insertTransaction({
+        account: 'one',
+        amount: 2500,
+        payee: await db.insertPayee({ name: 'b' }),
+        category: '1',
+        date: '2017-01-01',
+      });
+      const inTwo = await db.insertTransaction({
+        account: 'two',
+        amount: -2500,
+        payee: await db.insertPayee({ name: 'a' }),
+        category: '1',
+        date: '2017-01-01',
+      });
+
+      await applyActions(
+        [await db.getTransaction(inTwo)],
+        [{ op: 'set', field: 'payee', value: transferOne.id }],
+      );
+
+      const linked = await db.getTransaction(inOne);
+      expect(linked.transfer_id).toBe(inTwo);
+      expect(linked.category).toBeNull();
+      expect((await db.getTransaction(inTwo)).category).toBeNull();
+    });
+
+    test('the linked transaction keeps its category for an off-budget transfer', async () => {
+      await prepareDatabase();
+      const { transferOne } = await getTransferPayees();
+
+      const inOne = await db.insertTransaction({
+        account: 'one',
+        amount: 2500,
+        payee: await db.insertPayee({ name: 'b' }),
+        category: '1',
+        date: '2017-01-01',
+      });
+      const inThree = await db.insertTransaction({
+        account: 'three',
+        amount: -2500,
+        payee: await db.insertPayee({ name: 'a' }),
+        date: '2017-01-01',
+      });
+
+      await applyActions(
+        [await db.getTransaction(inThree)],
+        [{ op: 'set', field: 'payee', value: transferOne.id }],
+      );
+
+      const linked = await db.getTransaction(inOne);
+      expect(linked.transfer_id).toBe(inThree);
+      expect(linked.category).toBe('1');
+    });
+
     test('a starting balance is never linked', async () => {
       await prepareDatabase();
       const { transferOne } = await getTransferPayees();
