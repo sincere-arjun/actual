@@ -92,6 +92,61 @@ export async function addTransfer(transaction, transferredAccount) {
   };
 }
 
+// When an existing transaction becomes a transfer, the other side may already
+// exist in the destination account (e.g. both sides were entered or imported
+// before a rule turned them into a transfer). Find it so we can link to it
+// instead of creating a duplicate, but only when there is exactly one
+// unambiguous candidate.
+async function findExistingTransfer(transaction, transferredAccount) {
+  if (transaction.is_child) {
+    return null;
+  }
+
+  // Payee edits from the same batch are already written by now, so a
+  // candidate that is becoming a transfer to some other account is skipped
+  const candidates = await db.all<Pick<db.DbViewTransaction, 'id'>>(
+    `SELECT id FROM v_transactions
+       WHERE account = ? AND date = ? AND amount = ? AND id != ?
+         AND (transfer_id IS NULL OR transfer_id = ?)
+         AND is_parent = 0 AND is_child = 0 AND reconciled = 0
+         AND starting_balance_flag = 0
+         AND (payee IS NULL OR payee NOT IN (
+           SELECT id FROM v_payees
+             WHERE transfer_acct IS NOT NULL AND transfer_acct != ?
+         ))`,
+    [
+      transferredAccount,
+      db.toDateRepr(transaction.date),
+      -transaction.amount,
+      transaction.id,
+      transaction.id,
+      transaction.account,
+    ],
+  );
+  return candidates.length === 1 ? candidates[0].id : null;
+}
+
+async function linkTransfer(transaction, transferId, transferredAccount) {
+  const { id: fromPayee } = await getPayee(transaction.account);
+  await db.updateTransaction({
+    id: transferId,
+    transfer_id: transaction.id,
+    payee: fromPayee,
+    ...(transaction.schedule ? { schedule: transaction.schedule } : {}),
+  });
+  await db.updateTransaction({ id: transaction.id, transfer_id: transferId });
+  const categoryCleared = await clearCategory(
+    { ...transaction, transfer_id: transferId },
+    transferredAccount,
+  );
+
+  return {
+    id: transaction.id,
+    transfer_id: transferId,
+    ...(categoryCleared ? { category: null } : {}),
+  };
+}
+
 export async function removeTransfer(transaction) {
   const transferTrans = await db.getTransaction(transaction.transfer_id);
 
@@ -151,7 +206,10 @@ export async function onDelete(transaction) {
   }
 }
 
-export async function onUpdate(transaction) {
+// `claimed` holds the ids already paired up by other updates in the same
+// batch. Writes in a batch only land when it ends, so the database can't tell
+// us that another transaction has just linked to a candidate.
+export async function onUpdate(transaction, claimed = new Set<string>()) {
   const transferredAccount = await getTransferredAccount(transaction);
 
   if (transaction.is_parent) {
@@ -159,6 +217,21 @@ export async function onUpdate(transaction) {
   }
 
   if (transferredAccount && !transaction.transfer_id) {
+    const existingId = await findExistingTransfer(
+      transaction,
+      transferredAccount,
+    );
+
+    // No awaits between checking and updating the claims
+    if (claimed.has(transaction.id)) {
+      // Another transaction in this batch already linked to this one
+      return null;
+    }
+    claimed.add(transaction.id);
+    if (existingId && !claimed.has(existingId)) {
+      claimed.add(existingId);
+      return linkTransfer(transaction, existingId, transferredAccount);
+    }
     return addTransfer(transaction, transferredAccount);
   }
 

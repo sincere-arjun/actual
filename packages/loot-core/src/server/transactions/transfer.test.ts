@@ -2,7 +2,10 @@
 import { expectSnapshotWithDiffer } from '#mocks/util';
 import * as db from '#server/db';
 
+import { applyActions } from './transaction-rules';
 import * as transfer from './transfer';
+
+import { batchUpdateTransactions } from '.';
 
 beforeEach(global.emptyDatabase());
 
@@ -217,5 +220,452 @@ describe('Transfer', () => {
     child = await db.getTransaction(child.id);
     expect(child.transfer_id).not.toBe(parent.transfer_id);
     expect(child.payee).toBe(transferOne.id);
+  });
+
+  describe('linking existing transactions', () => {
+    async function getTransferPayees() {
+      const [transferOne, transferTwo] = await Promise.all([
+        db.first<db.DbPayee>(
+          "SELECT * FROM payees WHERE transfer_acct = 'one'",
+        ),
+        db.first<db.DbPayee>(
+          "SELECT * FROM payees WHERE transfer_acct = 'two'",
+        ),
+      ]);
+      return { transferOne, transferTwo };
+    }
+
+    async function getAccountTransactions(account: string) {
+      return (await getAllTransactions()).filter(t => t.account === account);
+    }
+
+    test('applying a transfer payee links the matching transaction in the other account', async () => {
+      await prepareDatabase();
+      const { transferOne, transferTwo } = await getTransferPayees();
+
+      const inOne = await db.insertTransaction({
+        account: 'one',
+        amount: 2500,
+        payee: await db.insertPayee({ name: 'b' }),
+        date: '2017-01-01',
+      });
+      const inTwo = await db.insertTransaction({
+        account: 'two',
+        amount: -2500,
+        payee: await db.insertPayee({ name: 'a' }),
+        date: '2017-01-01',
+      });
+
+      await applyActions(
+        [await db.getTransaction(inTwo)],
+        [{ op: 'set', field: 'payee', value: transferOne.id }],
+      );
+
+      const one = await getAccountTransactions('one');
+      const two = await getAccountTransactions('two');
+      expect(one).toHaveLength(1);
+      expect(two).toHaveLength(1);
+      expect(one[0]).toMatchObject({
+        id: inOne,
+        amount: 2500,
+        payee: transferTwo.id,
+        transfer_id: inTwo,
+      });
+      expect(two[0]).toMatchObject({
+        id: inTwo,
+        amount: -2500,
+        payee: transferOne.id,
+        transfer_id: inOne,
+      });
+    });
+
+    test('updating both sides in one batch links them to each other', async () => {
+      await prepareDatabase();
+      const { transferOne, transferTwo } = await getTransferPayees();
+
+      const inOne = await db.insertTransaction({
+        account: 'one',
+        amount: 2500,
+        payee: await db.insertPayee({ name: 'b' }),
+        date: '2017-01-01',
+      });
+      const inTwo = await db.insertTransaction({
+        account: 'two',
+        amount: -2500,
+        payee: await db.insertPayee({ name: 'a' }),
+        date: '2017-01-01',
+      });
+
+      await batchUpdateTransactions({
+        updated: [
+          { id: inOne, payee: transferTwo.id },
+          { id: inTwo, payee: transferOne.id },
+        ],
+      });
+
+      const one = await getAccountTransactions('one');
+      const two = await getAccountTransactions('two');
+      expect(one).toHaveLength(1);
+      expect(two).toHaveLength(1);
+      expect(one[0]).toMatchObject({ id: inOne, transfer_id: inTwo });
+      expect(two[0]).toMatchObject({ id: inTwo, transfer_id: inOne });
+    });
+
+    test('a new transfer is created when the match is ambiguous', async () => {
+      await prepareDatabase();
+      const { transferOne } = await getTransferPayees();
+
+      for (let i = 0; i < 2; i++) {
+        await db.insertTransaction({
+          account: 'one',
+          amount: 2500,
+          payee: await db.insertPayee({ name: `b${i}` }),
+          date: '2017-01-01',
+        });
+      }
+      const inTwo = await db.insertTransaction({
+        account: 'two',
+        amount: -2500,
+        payee: await db.insertPayee({ name: 'a' }),
+        date: '2017-01-01',
+      });
+
+      await applyActions(
+        [await db.getTransaction(inTwo)],
+        [{ op: 'set', field: 'payee', value: transferOne.id }],
+      );
+
+      const one = await getAccountTransactions('one');
+      expect(one).toHaveLength(3);
+      expect(one.filter(t => t.transfer_id === inTwo)).toHaveLength(1);
+      expect(one.filter(t => t.transfer_id == null)).toHaveLength(2);
+    });
+
+    test('a reconciled transaction is never linked', async () => {
+      await prepareDatabase();
+      const { transferOne } = await getTransferPayees();
+
+      const inOne = await db.insertTransaction({
+        account: 'one',
+        amount: 2500,
+        payee: await db.insertPayee({ name: 'b' }),
+        date: '2017-01-01',
+        reconciled: true,
+      });
+      const inTwo = await db.insertTransaction({
+        account: 'two',
+        amount: -2500,
+        payee: await db.insertPayee({ name: 'a' }),
+        date: '2017-01-01',
+      });
+
+      await applyActions(
+        [await db.getTransaction(inTwo)],
+        [{ op: 'set', field: 'payee', value: transferOne.id }],
+      );
+
+      const one = await getAccountTransactions('one');
+      expect(one).toHaveLength(2);
+      expect(one.find(t => t.id === inOne).transfer_id).toBeNull();
+    });
+
+    test('a candidate is linked at most once per batch', async () => {
+      await prepareDatabase();
+      const { transferTwo } = await getTransferPayees();
+
+      const sources = [];
+      for (let i = 0; i < 2; i++) {
+        sources.push(
+          await db.insertTransaction({
+            account: 'one',
+            amount: 2500,
+            payee: await db.insertPayee({ name: `b${i}` }),
+            date: '2017-01-01',
+          }),
+        );
+      }
+      const inTwo = await db.insertTransaction({
+        account: 'two',
+        amount: -2500,
+        payee: await db.insertPayee({ name: 'a' }),
+        date: '2017-01-01',
+      });
+
+      await applyActions(
+        await Promise.all(sources.map(id => db.getTransaction(id))),
+        [{ op: 'set', field: 'payee', value: transferTwo.id }],
+      );
+
+      const all = await getAllTransactions();
+      const byId = new Map(all.map(t => [t.id, t]));
+      for (const t of all) {
+        expect(t.transfer_id).not.toBeNull();
+        expect(byId.get(t.transfer_id).transfer_id).toBe(t.id);
+      }
+      const two = all.filter(t => t.account === 'two');
+      expect(two).toHaveLength(2);
+      expect(two.map(t => t.id)).toContain(inTwo);
+      expect(two.reduce((sum, t) => sum + t.amount, 0)).toBe(-5000);
+    });
+
+    test('a transaction added in the same batch is never linked', async () => {
+      await prepareDatabase();
+      const { transferOne, transferTwo } = await getTransferPayees();
+
+      const inOne = await db.insertTransaction({
+        account: 'one',
+        amount: 2500,
+        payee: await db.insertPayee({ name: 'b' }),
+        date: '2017-01-01',
+      });
+
+      await batchUpdateTransactions({
+        added: [
+          {
+            id: 'added',
+            account: 'two',
+            amount: -2500,
+            payee: transferOne.id,
+            date: '2017-01-01',
+          },
+        ],
+        updated: [{ id: inOne, payee: transferTwo.id }],
+      });
+
+      const all = await getAllTransactions();
+      const byId = new Map(all.map(t => [t.id, t]));
+      for (const t of all) {
+        expect(t.transfer_id).not.toBeNull();
+        expect(byId.get(t.transfer_id).transfer_id).toBe(t.id);
+      }
+      expect(all).toHaveLength(4);
+    });
+
+    test.each(['source', 'candidate'])(
+      'a transfer to another account set in the same batch is kept (%s updated first)',
+      async first => {
+        await prepareDatabase();
+        const { transferTwo } = await getTransferPayees();
+        const transferThree = await db.first<db.DbPayee>(
+          "SELECT * FROM payees WHERE transfer_acct = 'three'",
+        );
+
+        const inOne = await db.insertTransaction({
+          account: 'one',
+          amount: 2500,
+          payee: await db.insertPayee({ name: 'b' }),
+          date: '2017-01-01',
+        });
+        const inTwo = await db.insertTransaction({
+          account: 'two',
+          amount: -2500,
+          payee: await db.insertPayee({ name: 'a' }),
+          date: '2017-01-01',
+        });
+
+        const updates = [
+          { id: inOne, payee: transferTwo.id },
+          { id: inTwo, payee: transferThree.id },
+        ];
+        await batchUpdateTransactions({
+          updated: first === 'source' ? updates : updates.reverse(),
+        });
+
+        const all = await getAllTransactions();
+        const byId = new Map(all.map(t => [t.id, t]));
+        expect(all).toHaveLength(4);
+        for (const t of all) {
+          expect(t.transfer_id).not.toBeNull();
+          expect(byId.get(t.transfer_id).transfer_id).toBe(t.id);
+        }
+        expect(byId.get(inOne)).toMatchObject({ payee: transferTwo.id });
+        expect(byId.get(byId.get(inOne).transfer_id).account).toBe('two');
+        expect(byId.get(inTwo)).toMatchObject({ payee: transferThree.id });
+        expect(byId.get(byId.get(inTwo).transfer_id).account).toBe('three');
+      },
+    );
+
+    test('the linked transaction loses its category between on-budget accounts', async () => {
+      await prepareDatabase();
+      const { transferOne } = await getTransferPayees();
+
+      const inOne = await db.insertTransaction({
+        account: 'one',
+        amount: 2500,
+        payee: await db.insertPayee({ name: 'b' }),
+        category: '1',
+        date: '2017-01-01',
+      });
+      const inTwo = await db.insertTransaction({
+        account: 'two',
+        amount: -2500,
+        payee: await db.insertPayee({ name: 'a' }),
+        category: '1',
+        date: '2017-01-01',
+      });
+
+      await applyActions(
+        [await db.getTransaction(inTwo)],
+        [{ op: 'set', field: 'payee', value: transferOne.id }],
+      );
+
+      const linked = await db.getTransaction(inOne);
+      expect(linked.transfer_id).toBe(inTwo);
+      expect(linked.category).toBeNull();
+      expect((await db.getTransaction(inTwo)).category).toBeNull();
+    });
+
+    test('the linked transaction keeps its category for an off-budget transfer', async () => {
+      await prepareDatabase();
+      const { transferOne } = await getTransferPayees();
+
+      const inOne = await db.insertTransaction({
+        account: 'one',
+        amount: 2500,
+        payee: await db.insertPayee({ name: 'b' }),
+        category: '1',
+        date: '2017-01-01',
+      });
+      const inThree = await db.insertTransaction({
+        account: 'three',
+        amount: -2500,
+        payee: await db.insertPayee({ name: 'a' }),
+        date: '2017-01-01',
+      });
+
+      await applyActions(
+        [await db.getTransaction(inThree)],
+        [{ op: 'set', field: 'payee', value: transferOne.id }],
+      );
+
+      const linked = await db.getTransaction(inOne);
+      expect(linked.transfer_id).toBe(inThree);
+      expect(linked.category).toBe('1');
+    });
+
+    test('a starting balance is never linked', async () => {
+      await prepareDatabase();
+      const { transferOne } = await getTransferPayees();
+
+      const startingBalance = await db.insertTransaction({
+        account: 'one',
+        amount: 2500,
+        payee: await db.insertPayee({ name: 'Starting Balance' }),
+        date: '2017-01-01',
+        starting_balance_flag: true,
+      });
+      const inTwo = await db.insertTransaction({
+        account: 'two',
+        amount: -2500,
+        payee: await db.insertPayee({ name: 'a' }),
+        date: '2017-01-01',
+      });
+
+      await applyActions(
+        [await db.getTransaction(inTwo)],
+        [{ op: 'set', field: 'payee', value: transferOne.id }],
+      );
+
+      const one = await getAccountTransactions('one');
+      expect(one).toHaveLength(2);
+      expect(one.find(t => t.id === startingBalance).transfer_id).toBeNull();
+    });
+
+    test('the schedule is copied to the linked transaction', async () => {
+      await prepareDatabase();
+      const { transferOne } = await getTransferPayees();
+
+      const inOne = await db.insertTransaction({
+        account: 'one',
+        amount: 2500,
+        payee: await db.insertPayee({ name: 'b' }),
+        date: '2017-01-01',
+      });
+      const inTwo = await db.insertTransaction({
+        account: 'two',
+        amount: -2500,
+        payee: await db.insertPayee({ name: 'a' }),
+        date: '2017-01-01',
+        schedule: 'schedule1',
+      });
+
+      await applyActions(
+        [await db.getTransaction(inTwo)],
+        [{ op: 'set', field: 'payee', value: transferOne.id }],
+      );
+
+      const linked = await db.getTransaction(inOne);
+      expect(linked.transfer_id).toBe(inTwo);
+      expect(linked.schedule).toBe('schedule1');
+    });
+
+    // Pins today's behaviour behind the known limitation below, so the
+    // test.fails case can't pass just because linking broke
+    test('payee removed -> linked counterpart is deleted (current behaviour)', async () => {
+      await prepareDatabase();
+      const { transferOne } = await getTransferPayees();
+
+      const inOne = await db.insertTransaction({
+        account: 'one',
+        amount: 2500,
+        payee: await db.insertPayee({ name: 'b' }),
+        date: '2017-01-01',
+      });
+      const inTwo = await db.insertTransaction({
+        account: 'two',
+        amount: -2500,
+        payee: await db.insertPayee({ name: 'a' }),
+        date: '2017-01-01',
+      });
+
+      await applyActions(
+        [await db.getTransaction(inTwo)],
+        [{ op: 'set', field: 'payee', value: transferOne.id }],
+      );
+      expect((await db.getTransaction(inOne)).transfer_id).toBe(inTwo);
+
+      await batchUpdateTransactions({
+        updated: [{ id: inTwo, payee: await db.insertPayee({ name: 'c' }) }],
+      });
+
+      expect((await db.getTransaction(inTwo)).transfer_id).toBeNull();
+      expect(await db.getTransaction(inOne)).toBeUndefined();
+    });
+
+    // Known limitation: nothing records whether the other side of a transfer
+    // was created by Actual or already existed, so removeTransfer deletes it
+    // either way. Turn this into a regular test once that is distinguishable.
+    test.fails('payee removed -> pre-existing counterpart still exists', async () => {
+      await prepareDatabase();
+      const { transferOne } = await getTransferPayees();
+
+      const inOne = await db.insertTransaction({
+        account: 'one',
+        amount: 2500,
+        payee: await db.insertPayee({ name: 'b' }),
+        date: '2017-01-01',
+      });
+      const inTwo = await db.insertTransaction({
+        account: 'two',
+        amount: -2500,
+        payee: await db.insertPayee({ name: 'a' }),
+        date: '2017-01-01',
+      });
+
+      await applyActions(
+        [await db.getTransaction(inTwo)],
+        [{ op: 'set', field: 'payee', value: transferOne.id }],
+      );
+      expect((await db.getTransaction(inOne)).transfer_id).toBe(inTwo);
+
+      await batchUpdateTransactions({
+        updated: [{ id: inTwo, payee: await db.insertPayee({ name: 'c' }) }],
+      });
+
+      expect(await db.getTransaction(inTwo)).toMatchObject({
+        transfer_id: null,
+      });
+      expect(await db.getTransaction(inOne)).toBeDefined();
+    });
   });
 });
