@@ -94,6 +94,49 @@ export function isHappyPathQuery(queryState) {
   return queryState.filterExpressions.find(_isUnhappy) == null;
 }
 
+const NEGATED_OPS = ['$ne', '$notlike', '$notregexp'];
+
+// REGEXP tests a NULL value as an empty string. Only literal patterns
+// are checked, after unescaping `\$` the way `compileLiteral` does: a
+// named param (':name') is tested as the pattern itself, which is fine
+// while no caller passes named params
+function _regexpMatchesEmpty(regex) {
+  if (typeof regex !== 'string') {
+    // A pattern that is not a string can't be checked, so assume it
+    // might match
+    return true;
+  }
+  try {
+    return new RegExp(regex.replace(/\\\$/g, '$')).test('');
+  } catch {
+    // An invalid pattern matches nothing in REGEXP
+    return false;
+  }
+}
+
+// Whether the filter has a condition that an empty value can match,
+// like "is not" or "is nothing"
+function _matchesEmpty(filter) {
+  if (Array.isArray(filter)) {
+    return filter.some(_matchesEmpty);
+  }
+  if (filter == null || typeof filter !== 'object' || filter instanceof Date) {
+    return false;
+  }
+  return Object.entries(filter).some(([key, value]) => {
+    if (NEGATED_OPS.includes(key)) {
+      return true;
+    }
+    if (key === '$regexp') {
+      return _regexpMatchesEmpty(value);
+    }
+    if (key === '$eq' || !key.startsWith('$')) {
+      return value == null || _matchesEmpty(value);
+    }
+    return _matchesEmpty(value);
+  });
+}
+
 async function execTransactionsGrouped(
   compilerState: CompilerState,
   queryState: QueryState,
@@ -107,13 +150,14 @@ async function execTransactionsGrouped(
   // Aggregate queries don't make sense for a grouped transactions
   // query. We never should include both parent and children
   // transactions as it would duplicate amounts and the final number
-  // would never make sense. In this case, switch back to the "inline"
-  // type where only non-parent transactions are considered
+  // would never make sense. Instead, the matching children are
+  // counted, and a matching split parent is counted only when none of
+  // its children match. Split parents have no category and often no
+  // notes, so they match any filter for an empty value, like "is not";
+  // for those filters only the matching children are counted
   if (isAggregateQuery(queryState)) {
     const s = { ...sqlPieces };
-
-    // Modify the where to only include non-parents
-    s.where = appendWhere(s.where, `${s.from}.is_parent = 0`);
+    let aggParams = params;
 
     // We also want to exclude deleted transactions. Normally we
     // handle this manually down below, but now that we are doing a
@@ -121,11 +165,35 @@ async function execTransactionsGrouped(
     // has already been generated so we can't easily change the view
     // name here; instead, we change it and map it back to the name
     // used elsewhere in the query. Ideally we'd improve this
-    if (!withDead) {
-      s.from = 'v_transactions_internal_alive v_transactions_internal';
+    const from = withDead
+      ? s.from
+      : 'v_transactions_internal_alive v_transactions_internal';
+
+    if (
+      isHappyPathQuery(queryState) ||
+      queryState.filterExpressions.some(_matchesEmpty)
+    ) {
+      // Either every parent matches along with all of its children, or
+      // a parent may only match through an empty value, so we can
+      // simply count the non-parents
+      s.where = appendWhere(s.where, `${s.from}.is_parent = 0`);
+    } else {
+      // The subquery repeats the filter to find the parents with a
+      // matching child, so the params are bound a second time. This is
+      // only safe while every param sits in the where clause
+      s.where = appendWhere(
+        s.where,
+        `(${s.from}.is_parent = 0 OR ${s.from}.id NOT IN (
+          SELECT ${s.from}.parent_id FROM ${from} ${s.joins}
+          ${appendWhere(s.where, `${s.from}.is_child = 1`)}
+        ))`,
+      );
+      aggParams = [...params, ...params];
     }
 
-    return execQuery(queryState, compilerState, s, params, outputTypes);
+    s.from = from;
+
+    return execQuery(queryState, compilerState, s, aggParams, outputTypes);
   }
 
   let rows;
